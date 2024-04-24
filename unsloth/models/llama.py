@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import torch
+import peft
+
 from typing import Optional, Tuple, List, Union
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.llama.modeling_llama import (
@@ -51,7 +53,7 @@ pass
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, AutoConfig
 from transformers import set_seed as transformers_set_seed
-from peft import LoraConfig, TaskType, get_peft_model as _get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model as _get_peft_model, PeftModel
 from peft import PeftModelForCausalLM
 from bitsandbytes.nn import Linear4bit as Bnb_Linear4bit
 from peft.tuners.lora import Linear4bit as Peft_Linear4bit
@@ -1349,6 +1351,7 @@ class FastLlamaModel:
         modules_to_save     = None,
         init_lora_weights   = True,
         loftq_config        = {},
+        adapter_path        = None,
         **kwargs,
     ):
         transformers_set_seed(random_state)
@@ -1524,7 +1527,11 @@ class FastLlamaModel:
         if not SUPPORTS_RSLORA: del arguments["use_rslora"]
 
         lora_config = LoraConfig(**arguments)
-        model = _get_peft_model(model, lora_config)
+
+        if not adapter_path:
+            model = _get_peft_model(model, lora_config)
+        else:
+            model = PeftModel.from_pretrained(model, adapter_path)
 
         model = FastLlamaModel.patch_peft_model(model, use_gradient_checkpointing)
 
