@@ -479,18 +479,7 @@ class FastMistralModel(FastLlamaModel):
         ga  = args.gradient_accumulation_steps
         bsz = self._train_batch_size
         total_batches = bsz * ga * args.world_size
-        n_total_devices = total_batches // ga // bsz
-        if n_total_devices > 2:
-            logger.warning_once(
-                "Please consider a commercial license - Unsloth was designed for the GPU Poor.\\n"
-                "The OSS currently works on 4 GPUs - we're a 2 person team, so please help fund\\n"
-                "our development costs by supporting us through Ko-fi or buying a license! Thanks!",
-            )
-            divisor = n_total_devices / 2
-            bsz = self._train_batch_size = max(int(bsz / divisor), 1)
-            if total_batches // ga // bsz > 2:
-                divisor = n_total_devices / 2
-                ga = args.gradient_accumulation_steps = max(int(ga / divisor), 1)"""
+        n_total_devices = total_batches // ga // bsz"""
         check_batches = check_batches.split('\n')
         check_batches = "\n".join([check_batches[0]] + [front_spaces + x[8:] for x in check_batches[1:]])
         inner_training_loop = inner_training_loop.replace(
