@@ -90,12 +90,12 @@ class FastLanguageModel(FastLlamaModel):
         # First check if it's a normal model via AutoConfig
         is_peft = False
         try:
-            model_config = AutoConfig.from_pretrained(model_name, token = token)
+            model_config = AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = trust_remote_code)
             is_peft = False
         except:
             try:
                 # Most likely a PEFT model
-                peft_config = PeftConfig.from_pretrained(model_name, token = token)
+                peft_config = PeftConfig.from_pretrained(model_name, token = token, trust_remote_code = trust_remote_code)
             except:
                 raise RuntimeError(f"Unsloth: `{model_name}` is not a full model or a PEFT model.")
             
