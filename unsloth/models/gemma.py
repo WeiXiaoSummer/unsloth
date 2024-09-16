@@ -14,6 +14,7 @@
 
 from .llama import *
 from ._utils import __version__
+import math
 
 try:
     from transformers.models.gemma.modeling_gemma import (
@@ -205,27 +206,32 @@ class GemmaFixedRotaryEmbedding(torch.nn.Module):
     # Fixes https://github.com/huggingface/transformers/pull/28837
     # https://github.com/microsoft/DeepSpeed/issues/4932
     # The precision of RoPE buffers is not correct, so we cast to int64.
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, dim = None, max_position_embeddings=2048, base=10000, device=None,
+        config = None, # [TODO] Hack to pass in config - need to remove later
+    ):
         super().__init__()
+        if config is not None: return # [TODO] Hack to pass in config - need to remove later
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        # Dynamic RoPE we first set it to a max of 4 * 8192 tokens then we iteratively grow this
+        self.current_rope_size = min(4 * 8192, self.max_position_embeddings)
 
         # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=device, dtype=torch.get_default_dtype())
+        self._set_cos_sin_cache(seq_len=self.current_rope_size, device=device, dtype=torch.get_default_dtype())
     pass
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         # Note: on the original Llama codebase, these tensors are created on the target device (and not on CPU) and
         # in FP32. They are applied (multiplied) in FP32 as well.
-        self.max_seq_len_cached = seq_len
+        self.current_rope_size = seq_len
 
         # The difference is we do division explicity instead of t * (1/x) ie we do t/x.
         freq_exponents = (2.0 / self.dim) * (
             torch.arange(self.dim // 2, dtype = torch.int64, device = "cpu").float()
         )
         timescale = self.base**freq_exponents
-        positions = torch.arange(self.max_seq_len_cached, device = "cpu", dtype = torch.int64).float()
+        positions = torch.arange(self.current_rope_size, device = "cpu", dtype = torch.int64).float()
         radians_new = positions[..., None] / timescale[None, None, :]
         radians_new = radians_new.squeeze(0)
 
@@ -239,13 +245,24 @@ class GemmaFixedRotaryEmbedding(torch.nn.Module):
 
     def forward(self, x, position_ids=None, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
+        if seq_len > self.current_rope_size:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
             self.cos_cached[:seq_len].to(dtype=x.dtype),
             self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
+    pass
+
+    def get_cached(self, seq_len = None):
+        return self.cos_cached, self.sin_cached
+    pass
+
+    def extend_rope_embedding(self, x, seq_len):
+        if seq_len <= self.current_rope_size: return
+        # Iteratively grow by increments of 8192
+        self.current_rope_size = math.ceil(seq_len / 8192) * 8192
+        self._set_cos_sin_cache(self.current_rope_size, device = "cuda", dtype = x.dtype)
     pass
 pass
 
@@ -255,22 +272,24 @@ class GemmaFixedLinearScalingRotaryEmbedding(GemmaFixedRotaryEmbedding):
     # Fixes https://github.com/huggingface/transformers/pull/28837
     # https://github.com/microsoft/DeepSpeed/issues/4932
     # The precision of RoPE buffers is not correct, so we cast to int64.
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(self, dim = None, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0,
+        config = None, # [TODO] Hack to pass in config - need to remove later
+    ):
         self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
+        super().__init__(dim = dim, max_position_embeddings = max_position_embeddings, base = base, device = device, config = config)
     pass
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
 # Note: on the original Llama codebase, these tensors are created on the target device (and not on CPU) and
         # in FP32. They are applied (multiplied) in FP32 as well.
-        self.max_seq_len_cached = seq_len
+        self.current_rope_size = seq_len
 
         # The difference is we do division explicity instead of t * (1/x) ie we do t/x.
         freq_exponents = (2.0 / self.dim) * (
             torch.arange(self.dim // 2, dtype = torch.int64, device = "cpu").float()
         )
         timescale = self.base**freq_exponents
-        positions = torch.arange(self.max_seq_len_cached, device = "cpu", dtype = torch.int64).float()
+        positions = torch.arange(self.current_rope_size, device = "cpu", dtype = torch.int64).float()
         positions = positions /  self.scaling_factor
         radians_new = positions[..., None] / timescale[None, None, :]
         radians_new = radians_new.squeeze(0)

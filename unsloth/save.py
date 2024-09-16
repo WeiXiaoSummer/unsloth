@@ -28,12 +28,15 @@ import psutil
 import re
 from transformers.models.llama.modeling_llama import logger
 from .tokenizer_utils import fix_sentencepiece_gguf
+from huggingface_hub import HfApi
+from huggingface_hub.utils._token import get_token
 
 __all__ = [
     "print_quantization_methods",
     "unsloth_save_model",
     "save_to_gguf",
     "patch_saving_functions",
+    "create_huggingface_repo",
 ]
 
 # Check environments
@@ -205,11 +208,7 @@ def unsloth_save_model(
     temporary_location   : str = "_unsloth_temporary_saved_buffers",
     maximum_memory_usage : float = 0.9,
 ):
-    if token is None and "HF_TOKEN" in os.environ:
-        token = os.environ["HF_TOKEN"]
-
-    if token is None and "HUGGINGFACE_TOKEN" in os.environ:
-        token = os.environ["HUGGINGFACE_TOKEN"]
+    if token is None: token = get_token()
 
     if commit_message is None: commit_message = ""
     if "Unsloth" not in commit_message:
@@ -555,7 +554,8 @@ def unsloth_save_model(
                 logger.warning_once(f"We will save to Disk and not RAM now.")
                 filename = os.path.join(temporary_location, f"{name}.pt")
                 torch.save(W, filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL,)
-                state_dict[name] = torch.load(filename, map_location = "cpu", mmap = True)
+                # weights_only = True weirdly fails?
+                state_dict[name] = torch.load(filename, map_location = "cpu", mmap = True, weights_only = False)
         pass
         for item in LLAMA_LAYERNORMS:
             try:
@@ -675,7 +675,6 @@ def unsloth_save_model(
         # Now manually go through each file and upload them manually!
         filenames = os.listdir(new_save_directory)
 
-        from huggingface_hub import HfApi
         hf_api = HfApi(token = save_pretrained_settings["token"])
 
         print("Unsloth: Uploading all files... Please wait...")
@@ -1312,6 +1311,45 @@ def _determine_username(save_directory, old_username, token):
 pass
 
 
+def create_huggingface_repo(
+    model,
+    save_directory,
+    token = None,
+    private = False,
+):
+    if token is None :
+        token = get_token()
+    pass
+    save_directory, username = _determine_username(save_directory, "", token)
+
+    from huggingface_hub import create_repo
+    try:
+        create_repo(
+            repo_id   = save_directory,
+            token     = token,
+            repo_type = "model",
+            exist_ok  = False,
+            private   = private,
+        ) 
+
+        # Create model card
+        from huggingface_hub import ModelCard
+        content = MODEL_CARD.format(
+            username   = username,
+            base_model = model.config._name_or_path,
+            model_type = model.config.model_type,
+            method     = "",
+            extra      = "unsloth",
+        )
+        card = ModelCard(content)
+        card.push_to_hub(save_directory, token = token)
+    except:
+        pass
+    hf_api = HfApi(token = token)
+    return save_directory, hf_api
+pass
+
+
 def upload_to_huggingface(
     model,
     save_directory,
@@ -1321,6 +1359,7 @@ def upload_to_huggingface(
     file_location = None,
     old_username = None,
     private = None,
+    create_config = True,
 ):
     save_directory, username = _determine_username(save_directory, old_username, token)
 
@@ -1350,7 +1389,6 @@ def upload_to_huggingface(
 
     if file_location is not None:
         # Now upload file
-        from huggingface_hub import HfApi
         hf_api = HfApi(token = token)
 
         if "/" in file_location:
@@ -1372,6 +1410,8 @@ def upload_to_huggingface(
                     repo_type       = "model",
                     commit_message  = "(Trained with Unsloth)",
                 )
+            pass
+        pass
 
         hf_api.upload_file(
             path_or_fileobj = file_location,
@@ -1382,18 +1422,20 @@ def upload_to_huggingface(
         )
 
         # We also upload a config.json file
-        import json
-        with open("_temporary_unsloth_config.json", "w") as file:
-            json.dump({"model_type" : model.config.model_type}, file, indent = 4)
+        if create_config:
+            import json
+            with open("_temporary_unsloth_config.json", "w") as file:
+                json.dump({"model_type" : model.config.model_type}, file, indent = 4)
+            pass
+            hf_api.upload_file(
+                path_or_fileobj = "_temporary_unsloth_config.json",
+                path_in_repo    = "config.json",
+                repo_id         = save_directory,
+                repo_type       = "model",
+                commit_message  = "(Trained with Unsloth)",
+            )
+            os.remove("_temporary_unsloth_config.json")
         pass
-        hf_api.upload_file(
-            path_or_fileobj = "_temporary_unsloth_config.json",
-            path_in_repo    = "config.json",
-            repo_id         = save_directory,
-            repo_type       = "model",
-            commit_message  = "(Trained with Unsloth)",
-        )
-        os.remove("_temporary_unsloth_config.json")
     pass
     return username
 pass
@@ -1441,14 +1483,23 @@ def create_ollama_modelfile(tokenizer, gguf_location):
 
     modelfile = modelfile\
         .replace("{{", "⚫@✅#🦥")\
-        .replace("}}", "⚡@🦥#⛵")\
-        .format(
+        .replace("}}", "⚡@🦥#⛵")
+    
+    if "__EOS_TOKEN__" in modelfile:
+        modelfile = modelfile.format(
             __FILE_LOCATION__  = gguf_location,
-        )\
+            __EOS_TOKEN__      = tokenizer.eos_token,
+        )
+    else:
+        modelfile = modelfile.format(
+            __FILE_LOCATION__  = gguf_location,
+        )
+    pass
+    
+    modelfile = modelfile\
         .replace("⚫@✅#🦥", "{{")\
         .replace("⚡@🦥#⛵", "}}")\
         .rstrip()
-    pass
 
     return modelfile
 pass

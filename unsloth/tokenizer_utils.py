@@ -42,12 +42,12 @@ IGNORED_TOKENIZER_CHECKING = frozenset((
 
 
 IGNORED_TOKENIZER_NAMES = [
-    "unsloth/Mistral-Nemo-Instruct-2407-bnb-4bit",
-    "unsloth/Mistral-Nemo-Instruct-2407",
-    "mistralai/Mistral-Nemo-Instruct-2407",
-    "unsloth/Mistral-Nemo-Base-2407-bnb-4bit",
-    "unsloth/Mistral-Nemo-Base-2407",
-    "mistralai/Mistral-Nemo-Base-2407",
+    # "unsloth/Mistral-Nemo-Instruct-2407-bnb-4bit",
+    # "unsloth/Mistral-Nemo-Instruct-2407",
+    # "mistralai/Mistral-Nemo-Instruct-2407",
+    # "unsloth/Mistral-Nemo-Base-2407-bnb-4bit",
+    # "unsloth/Mistral-Nemo-Base-2407",
+    # "mistralai/Mistral-Nemo-Base-2407",
 ]
 IGNORED_TOKENIZER_NAMES = frozenset(
     [x.lower() for x in IGNORED_TOKENIZER_NAMES]
@@ -454,13 +454,14 @@ def fix_sentencepiece_gguf(saved_location):
 pass
 
 
-def load_correct_tokenizer(
+def _load_correct_tokenizer(
     tokenizer_name,
     model_max_length = None,
     padding_side = "right",
     token = None,
     trust_remote_code = False,
     cache_dir = "huggingface_tokenizers_cache",
+    fix_tokenizer = True,
 ):
     if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
         cache_dir = cache_dir
@@ -501,7 +502,10 @@ def load_correct_tokenizer(
         cache_dir         = cache_dir,
     )
 
-    if tokenizer_name in IGNORED_TOKENIZER_NAMES:
+    if not fix_tokenizer or tokenizer_name in IGNORED_TOKENIZER_NAMES:
+        return fast_tokenizer
+    # Ignore Mistral ones - they're a bit weird to handle!
+    elif "mistral" in tokenizer_name.lower():
         return fast_tokenizer
     elif slow_tokenizer is not None:
         if hasattr(fast_tokenizer, "add_bos_token") and hasattr(slow_tokenizer, "add_bos_token"):
@@ -519,6 +523,139 @@ def load_correct_tokenizer(
     else:
         return fast_tokenizer
     pass
+pass
+
+
+def load_correct_tokenizer(
+    tokenizer_name,
+    model_max_length = None,
+    padding_side = "right",
+    token = None,
+    trust_remote_code = False,
+    cache_dir = "huggingface_tokenizers_cache",
+    fix_tokenizer = True,
+):
+    tokenizer = _load_correct_tokenizer(
+        tokenizer_name = tokenizer_name,
+        model_max_length = model_max_length,
+        padding_side = padding_side,
+        token = token,
+        trust_remote_code = trust_remote_code,
+        cache_dir = cache_dir,
+        fix_tokenizer = fix_tokenizer,
+    )
+
+    ### 1. Fixup tokenizer's chat_template
+    old_chat_template = getattr(tokenizer, "chat_template", None)
+
+    # Ignore mistral type models since they don't have a add_generation_prompt
+    if "mistral" in str(getattr(tokenizer, "name_or_path", "")).lower():
+        chat_template = old_chat_template
+
+    # Also check Llama-2 old style models
+    elif old_chat_template is not None and \
+        "[/INST]" in old_chat_template and "[INST]" in old_chat_template and \
+        "bos_token" in old_chat_template and "eos_token" in old_chat_template:
+
+        chat_template = old_chat_template
+
+    else:
+        chat_template = fix_chat_template(tokenizer)
+        if old_chat_template is not None and chat_template is None:
+            raise RuntimeError(
+                "Unsloth: Fixing chat template failed - please file a report immediately!"
+            )
+        pass
+    pass
+
+    tokenizer.chat_template = chat_template
+    return tokenizer
+pass
+
+
+def _fix_chat_template(chat_template):
+    endfor = "{% endfor %}"
+    where = chat_template.find(endfor)
+    if where == -1: return chat_template
+
+    after_endfor = chat_template[where + len(endfor):]
+
+    if "{% if" not in after_endfor and "{% set " not in after_endfor and \
+        after_endfor.startswith("{{") and after_endfor.endswith("}}") and \
+        after_endfor.count("{{") == 1 and after_endfor.count("}}") == 1:
+
+        after_endfor = "{% if add_generation_prompt %}" + after_endfor + "{% endif %}"
+
+        chat_template = chat_template[:where + len(endfor)] + after_endfor
+    pass
+    return chat_template
+pass
+
+
+def fix_chat_template(tokenizer):
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if chat_template is None: return None
+
+    ### 1. Check if add_generation_prompt works
+    # Check for ShareGPT style first
+    is_sharegpt = None
+    try:
+        messages = [
+            {"role": "user", "content": "Who are you?"},
+        ]
+        tokenizer.apply_chat_template(messages, add_generation_prompt = False, tokenize = False)
+        is_sharegpt = False
+    except:
+        try:
+            messages = [
+                {"from": "human", "value": "Who are you?"},
+            ]
+            tokenizer.apply_chat_template(messages, add_generation_prompt = False, tokenize = False)
+            is_sharegpt = True
+        except:
+            is_sharegpt = None
+        pass
+    pass
+
+    # Not ShareGPT or HF style - just return
+    if is_sharegpt is None: return chat_template
+
+    # Tokenize
+    messages = [
+        {"role": "user", "content": "Who are you?"} \
+        if not is_sharegpt else \
+        {"from": "human", "value": "Who are you?"}
+    ]
+    no  = tokenizer.apply_chat_template(messages, add_generation_prompt = False, tokenize = False)
+    yes = tokenizer.apply_chat_template(messages, add_generation_prompt =  True, tokenize = False)
+
+    if no == yes:
+        # SAME?! That's not good! We check for add_generation_prompt
+        if "{% if add_generation_prompt %}" not in chat_template:
+            # Try fixing it by adding it
+            new_chat_template = _fix_chat_template(chat_template)
+            if "{% if add_generation_prompt %}" not in new_chat_template:
+                raise RuntimeError(
+                    f"Unsloth: The tokenizer `{tokenizer.name_or_path}`\n"\
+                    "does not have a {% if add_generation_prompt %} for generation purposes.\n"\
+                    "Please file a bug report immediately - thanks!"
+                )
+            else:
+                logger.warning_once(
+                    "Unsloth: We successfully patched the tokenizer to add a {% if add_generation_prompt %} to the chat_template.\n"\
+                    "This is not a bug, but please notify the Unsloth maintainers - thanks!"
+                )
+                chat_template = new_chat_template
+            pass
+        else:
+            raise RuntimeError(
+                f"Unsloth: The tokenizer `{tokenizer.name_or_path}`\n"\
+                "has a {% if add_generation_prompt %} for generation purposes, but wasn't provided correctly.\n"\
+                "Please file a bug report immediately - thanks!"
+            )
+        pass
+    pass
+    return chat_template
 pass
 
 
@@ -688,7 +825,32 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, eps = 1e-16):
     pass
 
     # Get untrained tokens
-    indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained1 = torch.amax(embedding_matrix, axis = 1) <= eps
+    # Check lm_head as well
+
+    # Does NOT work for Llama 3.1!!
+    indicator_untrained2 = torch.amax(lm_head_matrix,   axis = 1) <= eps
+
+    # We instead check for repeated vectors
+    lm_head_where = torch.where(indicator_untrained1)[0]
+    lm_head_bad = lm_head_matrix[lm_head_where]
+    lm_head_bad = lm_head_bad.cpu().float().numpy().round(3)
+    from collections import Counter
+    counter = Counter()
+    for row in lm_head_bad: counter[hash(row.data.tobytes())] += 1
+    counter = Counter({k: c for k, c in counter.items() if c >= 2})
+
+    lm_head_where = lm_head_where.cpu().numpy()
+    final_bad_lm_head = []
+    for j, row in enumerate(lm_head_bad):
+        if hash(row.data.tobytes()) in counter:
+            final_bad_lm_head.append(lm_head_where[j])
+    indicator_untrained2 = indicator_untrained2 | torch.zeros_like(indicator_untrained2)
+    indicator_untrained2[final_bad_lm_head] = True
+
+    # Combine both checks
+    indicator_untrained = indicator_untrained1 & indicator_untrained2
+    
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
@@ -947,6 +1109,7 @@ from inspect import getsource
 import trl.trainer.sft_trainer
 from trl.trainer.sft_trainer import *
 from transformers.trainer import *
+from trl.trainer.sft_trainer import neftune_post_forward_hook
 
 def patch_sft_trainer_tokenizer():
     """
@@ -980,44 +1143,73 @@ def patch_sft_trainer_tokenizer():
     pass
 
     # Patch train with fix_untrained_tokens
-    function_name, replacer = "train", "if resume_from_checkpoint is False:"
-    function = getsource(eval(f"trl.trainer.sft_trainer.SFTTrainer.{function_name}"))
-    where = function.find("def")
-    function = function.split("\n")
-    function = "\n".join(x[where:] for x in function)
+    for path_to_trainer in \
+        ("sft_trainer.SFTTrainer", "dpo_trainer.DPOTrainer", "kto_trainer.KTOTrainer"):
 
-    check_text = \
-    "\n"\
-    "if self._inner_training_loop.__name__ != '_fast_inner_training_loop':\n"\
-    "    raise RuntimeError(\n"\
-    "       'Please do not edit specific areas of the Unsloth codebase or you will get CUDA segfaults.'\n"\
-    "    )\n"\
-    "pass\n"\
-    "import subprocess, re, gc, numpy as np\n"\
-    "a = np.array([0,])\n"\
-    "try:\n"\
-    "    a = subprocess.check_output('nvidia-smi --query-gpu=memory.used --format=csv', shell = True)\n"\
-    "    a = re.findall(rb'([\\d]{1,})[\\s]{1,}M', a)\n"\
-    "    a = np.array([int(x.decode('utf-8'))/1024 for x in a])\n"\
-    "except:\n"\
-    "    if not torch.cuda.is_available():\n"\
-    "        raise RuntimeError('Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!')\n"\
-    "if ((a - PRE_CHECK) >= 1).sum() > 1:\n"\
-    "    raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')\n"\
-    "for _ in range(3):\n"\
-    "    gc.collect()\n"\
-    "    torch.cuda.empty_cache()\n"\
-    "pass\n"\
-    "\n"\
-    "fix_untrained_tokens(self.model, self.tokenizer, self.train_dataset, eps = 1e-16)\n\n"
+        function_name, replacer = "train", "if resume_from_checkpoint is False:"
+        function = getsource(eval(f"trl.trainer.{path_to_trainer}.{function_name}"))
+        where = function.find("def")
+        function = function.split("\n")
+        function = "\n".join(x[where:] for x in function)
 
-    check_text = check_text.split("\n")
-    check_text = "\n".join(" "*where + x for x in check_text)
+        check_text = \
+        "\n"\
+        "if self._inner_training_loop.__name__ != '_fast_inner_training_loop':\n"\
+        "    raise RuntimeError(\n"\
+        "       'Please do not edit specific areas of the Unsloth codebase or you will get CUDA segfaults.'\n"\
+        "    )\n"\
+        "pass\n"\
+        "import subprocess, re, gc, numpy as np\n"\
+        "a = np.array([0,])\n"\
+        "try:\n"\
+        "    a = subprocess.check_output('nvidia-smi --query-gpu=memory.used --format=csv', shell = True)\n"\
+        "    a = re.findall(rb'([\\d]{1,})[\\s]{1,}M', a)\n"\
+        "    a = np.array([int(x.decode('utf-8'))/1024 for x in a])\n"\
+        "except:\n"\
+        "    if not torch.cuda.is_available():\n"\
+        "        raise RuntimeError('Unsloth: We do not support AMD / Intel machines yet - it is a work in progress!')\n"\
+        "if ((a - PRE_CHECK) >= 1).sum() > 1:\n"\
+        "    raise RuntimeError('Unsloth currently does not support multi GPU setups - but we are working on it!')\n"\
+        "for _ in range(3):\n"\
+        "    gc.collect()\n"\
+        "    torch.cuda.empty_cache()\n"\
+        "pass\n"\
+        "\n"\
+        "fix_untrained_tokens(self.model, self.tokenizer, self.train_dataset, eps = 1e-16)\n\n"
 
-    function = function.replace(replacer, check_text + replacer)
-    exec(function, globals())
+        # Add NEFTune since it doesn't seem to work?? We need to manually inject it
+        check_text += \
+        "\n"\
+        "if hasattr(self, 'neftune_hook_handle'):\n"\
+        "    self.neftune_hook_handle.remove()\n"\
+        "    if hasattr(self, 'neftune_hook_handle'): del self.neftune_hook_handle\n"\
+        "\n"\
+        "if getattr(self, 'neftune_noise_alpha', None) is not None:\n"\
+        "    self.model.get_input_embeddings().neftune_noise_alpha = self.neftune_noise_alpha\n"\
+        "    self.neftune_hook_handle = self.model.get_input_embeddings().register_forward_hook(neftune_post_forward_hook)\n"\
+        "pass\n"\
+        "\n"
 
-    exec(f"trl.trainer.sft_trainer.SFTTrainer.{function_name} = {function_name}", globals())
+        # Also DPO weirdly tokenizes non numeric columns? Delete them!
+        check_text += \
+        "\n"\
+        "column_names = set(self.train_dataset.column_names)\n"\
+        "check = ['chosen', 'rejected', 'prompt', 'chosen_input_ids', 'chosen_attention_mask',\n"\
+        " 'chosen_labels', 'rejected_input_ids', 'rejected_attention_mask', 'rejected_labels',\n"\
+        " 'prompt_input_ids', 'prompt_attention_mask']\n"\
+        "if all(x in column_names for x in check):\n"\
+        "    self.train_dataset = self.train_dataset.remove_columns(['chosen', 'rejected', 'prompt'])\n"\
+        "del check, column_names\n"\
+        "\n"
+
+        check_text = check_text.split("\n")
+        check_text = "\n".join(" "*where + x for x in check_text)
+
+        function = function.replace(replacer, check_text + replacer)
+        exec(function, globals())
+
+        exec(f"trl.trainer.{path_to_trainer}.{function_name} = {function_name}", globals())
+    pass
 pass
 
 patch_sft_trainer_tokenizer()
